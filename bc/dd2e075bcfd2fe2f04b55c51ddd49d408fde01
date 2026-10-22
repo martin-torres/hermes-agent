@@ -1,0 +1,22 @@
+hermes_cli/cli_model_switch_mixin.py
+  h_11d592aaeb00de 386-390
+hermes_cli/cli_tui_mixin.py
+  h_11d592aaeb00de 608,610-612,614-618,626-628
+hermes_cli/model_picker_specs.py
+  h_11d592aaeb00de 1-210
+locales/en.yaml
+  h_11d592aaeb00de 2190
+tests/hermes_cli/test_model_picker_specs.py
+  h_11d592aaeb00de 1-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bcdd2e075bcfd2fe2f04b55c51ddd49d408fde01",
+  "prompts": {},
+  "humans": {
+    "h_11d592aaeb00de": {
+      "author": "Drtorres <dr.mtorres@icloud.com>"
+    }
+  }
+}
