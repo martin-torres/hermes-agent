@@ -1,0 +1,26 @@
+artifacts/model-picker-price-specs/README.md
+  h_11d592aaeb00de 1-12
+artifacts/model-picker-price-specs/apply_to_fork.py
+  h_11d592aaeb00de 1-132
+artifacts/model-picker-price-specs/commit-message.txt
+  h_11d592aaeb00de 1-29
+artifacts/model-picker-price-specs/model-picker-price-specs.patch
+  h_11d592aaeb00de 1-452
+artifacts/model-picker-price-specs/model_picker_specs.py
+  h_11d592aaeb00de 1-198
+artifacts/model-picker-price-specs/pr-body.md
+  h_11d592aaeb00de 1-49
+artifacts/model-picker-price-specs/test_model_picker_specs.py
+  h_11d592aaeb00de 1-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bed1d4896773a4dac390ae731c2b00c493eda262",
+  "prompts": {},
+  "humans": {
+    "h_11d592aaeb00de": {
+      "author": "Drtorres <dr.mtorres@icloud.com>"
+    }
+  }
+}
