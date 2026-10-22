@@ -1,0 +1,452 @@
+diff --git a/hermes_cli/cli_model_switch_mixin.py b/hermes_cli/cli_model_switch_mixin.py
+index cc74086f10..889cb8d08e 100644
+--- a/hermes_cli/cli_model_switch_mixin.py
++++ b/hermes_cli/cli_model_switch_mixin.py
+@@ -296,6 +296,11 @@ def _show_model_picker(cli, ctx, force_refresh: bool) -> None:
+             ctx, probe_custom_providers=force_refresh,
+             probe_current_custom_provider=not force_refresh,
+             capabilities=True,  # the effort step hides itself on reasoning-free routes
++            # Row suffixes carry price + context + capabilities, with FREE where it applies.
++            # cache-only pricing keeps the picker non-blocking: a cold endpoint is warmed by the
++            # background worker and its prices appear on the next open instead of stalling the REPL.
++            pricing=True,
++            pricing_cache_only=True,
+             # Keep providers whose pool is entirely in cooldown visible: limits are
+             # per-model for many providers, so another model may work (#103829) —
+             # same contract as the gateway picker (#66584) and aux pickers (#66624).
+diff --git a/hermes_cli/cli_tui_mixin.py b/hermes_cli/cli_tui_mixin.py
+index d311276124..32c561ffc1 100644
+--- a/hermes_cli/cli_tui_mixin.py
++++ b/hermes_cli/cli_tui_mixin.py
+@@ -638,14 +638,23 @@ class CLITuiMixin:
+             _query = state.get("filter", "") or ""
+             filtered_pairs = self._filter_model_picker_entries(model_list, _query)
+             state["_filtered_pairs"] = filtered_pairs
+-            model_labels = [e for (_i, e) in filtered_pairs]
++            # Rows show the id plus price/context/capabilities (FREE where it applies).
++            # ``_filtered_pairs`` keeps the RAW ids — filtering and the commit both resolve
++            # against them, so decorating the label can never change which model is selected.
++            from hermes_cli.model_picker_specs import decorate_model_label, rows_have_pricing
++            model_labels = [
++                decorate_model_label(_candidate, provider_data) for (_i, _candidate) in filtered_pairs
++            ]
+             choices = list(model_labels) + [t("cli.shared.back"), t("cli.shared.cancel")]
++            legend = t("cli.tui.picker_pricing_legend") if rows_have_pricing(model_labels) else ""
+             if _query:
+                 hint = t("cli.tui.picker_filter_hint", query=_query, shown=len(model_labels), total=len(model_list))
+             elif model_list:
+                 hint = t("cli.tui.picker_select_hint", count=len(model_list))
+             else:
+                 hint = t("cli.tui.picker_empty")
++            if legend:
++                hint = f"{hint}{' · ' if hint else ''}{legend}"
+         return self._render_scroll_list_panel(
+             state, title, hint, choices, min_width=46, max_width=84, indent='  ')
+ 
+diff --git a/hermes_cli/model_picker_specs.py b/hermes_cli/model_picker_specs.py
+new file mode 100644
+index 0000000000..fd10ff5f4d
+--- /dev/null
++++ b/hermes_cli/model_picker_specs.py
+@@ -0,0 +1,198 @@
++"""Per-model spec suffixes for the ``/model`` picker rows.
++
++The picker listed bare model ids, which say nothing about price, context or capabilities —
++and the one fact a user needs most, "this one is free", was invisible on every row. This
++module builds the compact suffix appended to each model row::
++
++    claude-sonnet-4-5 · $3/$15 · 1.0M ctx · 64K out · reasoning, vision
++    beam-free · FREE · 1.0M ctx · 128K out · reasoning
++    big-pickle · FREE · 200K ctx · 64K out · reasoning, tools
++
++Two metadata sources, in priority order:
++
++1. **The provider's own live pricing**, attached by ``inventory._apply_pricing`` as
++   ``row["pricing"][model]`` for providers whose catalog publishes prices (OpenRouter, Nous,
++   Vercel AI Gateway, Novita, Fireworks, DeepInfra, Kilo).
++2. **models.dev** — cost per Mtok, context window, max output, capabilities. This is the ONLY
++   source covering ``opencode-go`` / ``opencode-zen``: their ``/v1/models`` endpoints publish no
++   prices at all (verified — ``get_pricing_for_provider("opencode-go")`` returns 0 entries), so
++   without models.dev every opencode row renders with no price and free models (``beam-free``,
++   ``ring-2.6-1t-free``, ``big-pickle``, …) never get labeled.
++
++Missing metadata renders as NO suffix, never a guess: a wrong price is worse than no price.
++Suffixes are memoized per (provider slug, model id) because the picker re-renders on every
++filter keystroke.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Optional
++
++# Label vocabulary, kept in one place so translating the row chrome is a one-file change.
++FREE_LABEL = "FREE"
++CTX_SUFFIX = "ctx"
++OUT_SUFFIX = "out"
++REASONING_LABEL = "reasoning"
++VISION_LABEL = "vision"
++PDF_LABEL = "PDF"
++AUDIO_LABEL = "audio"
++SEPARATOR = " · "
++
++# models.dev ids differ from Hermes provider slugs; the opencode family is served from two
++# models.dev providers, and a model present in one is often only priced in the other
++# (deepseek-v4-flash resolves under "opencode" but not under "opencode-go").
++_MODELS_DEV_CANDIDATES: dict[str, tuple[str, ...]] = {
++    "opencode-go": ("opencode-go", "opencode"),
++    "opencode-zen": ("opencode-zen", "opencode"),
++    "opencode": ("opencode",),
++}
++
++# (provider slug, model id) -> rendered suffix. Populated on first render of a row.
++_spec_cache: dict[tuple[str, str], str] = {}
++
++
++def clear_spec_cache() -> None:
++    """Drop memoized suffixes (tests, and after a catalog refresh changes the metadata)."""
++    _spec_cache.clear()
++
++
++def _fmt_tokens(count: Any) -> str:
++    """Token count as ``1.0M`` / ``128K`` / ``512``. Non-numeric input yields ""."""
++    try:
++        value = int(count)
++    except (TypeError, ValueError):
++        return ""
++    if value <= 0:
++        return ""
++    if value >= 1_000_000:
++        text = f"{value / 1_000_000:.1f}".rstrip("0").rstrip(".")
++        return f"{text}M"
++    if value >= 1_000:
++        return f"{value // 1_000}K"
++    return str(value)
++
++
++def _fmt_mtok(per_million: Any) -> str:
++    """models.dev USD-per-million-token float as ``$3`` / ``$0.14`` / ``$0.0341``."""
++    try:
++        value = float(per_million)
++    except (TypeError, ValueError):
++        return ""
++    if value == 0:
++        return "$0"
++    text = f"{value:.2f}" if value >= 0.01 else f"{value:.6f}".rstrip("0").rstrip(".")
++    text = text.rstrip("0").rstrip(".") if "." in text else text
++    return f"${text}"
++
++
++def _id_says_free(model_id: str) -> bool:
++    """The provider's own free-tier naming: ``-free`` (opencode) / ``:free`` (OpenRouter)."""
++    return model_id.endswith("-free") or model_id.endswith(":free")
++
++
++def _lookup_models_dev(slug: str, model_id: str, config: Optional[dict]) -> Any:
++    """models.dev ``ModelInfo`` for provider+model, trying the family's candidate ids."""
++    try:
++        from agent.models_dev import get_model_info
++    except Exception:
++        return None
++    for candidate in _MODELS_DEV_CANDIDATES.get(slug.lower(), (slug,) if slug else ()):
++        try:
++            info = get_model_info(candidate, model_id, config=config)
++        except Exception:
++            info = None
++        if info is not None:
++            return info
++    return None
++
++
++def _capability_flags(info: Any, caps: dict) -> list[str]:
++    """Noteworthy capabilities, in row order. ``tools``/``structured output`` are omitted — they
++    hold for nearly every model and would push the price off the row."""
++    flags: list[str] = []
++    reasoning = caps.get("reasoning") if isinstance(caps, dict) else None
++    if reasoning is None and info is not None:
++        reasoning = info.reasoning
++    if reasoning:
++        flags.append(REASONING_LABEL)
++    vision = caps.get("vision") if isinstance(caps, dict) else None
++    if vision is None and info is not None:
++        try:
++            vision = info.supports_vision()
++        except Exception:
++            vision = None
++    if vision:
++        flags.append(VISION_LABEL)
++    if info is not None:
++        try:
++            if info.supports_pdf():
++                flags.append(PDF_LABEL)
++            if info.supports_audio_input():
++                flags.append(AUDIO_LABEL)
++        except Exception:
++            pass
++    return flags
++
++
++def _build_suffix(model_id: str, provider_row: dict, *, config: Optional[dict] = None) -> str:
++    """Rendered suffix for one row, or "" when nothing is known about the model."""
++    pricing = (provider_row.get("pricing") or {}).get(model_id) or {}
++    caps = (provider_row.get("capabilities") or {}).get(model_id) or {}
++    slug = str(provider_row.get("slug") or "")
++    info = _lookup_models_dev(slug, model_id, config)
++
++    free = bool(pricing.get("free")) or _id_says_free(model_id)
++    price_in = price_out = ""
++    if pricing.get("input") or pricing.get("output"):
++        # Provider's own feed wins: it is what this account will actually be billed.
++        price_in, price_out = str(pricing.get("input") or "?"), str(pricing.get("output") or "?")
++    elif info is not None and (info.cost_input or info.cost_output):
++        price_in, price_out = _fmt_mtok(info.cost_input), _fmt_mtok(info.cost_output)
++    elif info is not None:
++        # A catalog entry whose both directions cost nothing IS the free tier (verified across
++        # opencode-go/zen: every zero-cost entry is a free SKU, including unsuffixed ones).
++        free = True
++
++    parts: list[str] = []
++    if free:
++        parts.append(FREE_LABEL)
++    elif price_in or price_out:
++        parts.append(f"{price_in or '?'}/{price_out or '?'}")
++
++    if info is not None:
++        if ctx := _fmt_tokens(info.context_window):
++            parts.append(f"{ctx} {CTX_SUFFIX}")
++        if out := _fmt_tokens(info.max_output):
++            parts.append(f"{out} {OUT_SUFFIX}")
++    if flags := _capability_flags(info, caps if isinstance(caps, dict) else {}):
++        parts.append(", ".join(flags))
++    if info is not None and info.status:
++        parts.append(info.status)
++
++    return SEPARATOR + SEPARATOR.join(parts) if parts else ""
++
++
++def decorate_model_label(
++    model_id: str, provider_row: Optional[dict], *, config: Optional[dict] = None
++) -> str:
++    """``model_id`` with its price/context/capability suffix — what the picker row renders.
++
++    The RAW id stays the first token so a row can never be mistaken for a different model, and
++    resolution/commit still works off ``provider_row["models"]``, never off this label.
++    """
++    row = provider_row or {}
++    slug = str(row.get("slug") or "")
++    key = (slug, model_id)
++    cached = _spec_cache.get(key)
++    if cached is None:
++        try:
++            cached = _build_suffix(model_id, row, config=config)
++        except Exception:
++            cached = ""  # a metadata failure must never cost the user the row
++        _spec_cache[key] = cached
++    return f"{model_id}{cached}"
++
++
++def rows_have_pricing(labels: list[str]) -> bool:
++    """True when any decorated row carries a price or the FREE badge — gates the hint legend."""
++    return any(("$" in label) or (FREE_LABEL in label) for label in labels)
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 4d6426e2d5..1b74ac82bf 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -2149,6 +2149,7 @@ cli:
+     picker_provider_fallback: "Provider"
+     picker_filter_hint: "Filter: {query}▏  ({shown}/{total} match — type to narrow, Backspace to clear)"
+     picker_select_hint: "Select a model ({count} available) — type to filter"
++    picker_pricing_legend: "price = $ per 1M tokens (in/out), FREE = no charge"
+     picker_empty: "No models listed for this provider. Use Back or Cancel."
+     palette_title: "⚙ Command Palette"
+     palette_filter_hint: "Filter: {query}▏  ({shown}/{total} match — Enter inserts, Esc cancels)"
+diff --git a/tests/hermes_cli/test_model_picker_specs.py b/tests/hermes_cli/test_model_picker_specs.py
+new file mode 100644
+index 0000000000..500a1915fa
+--- /dev/null
++++ b/tests/hermes_cli/test_model_picker_specs.py
+@@ -0,0 +1,185 @@
++"""``/model`` picker row specs: price, context window, capabilities, and the FREE badge.
++
++The picker rendered bare model ids, so nothing on screen said what a model costs and free
++models (``beam-free``, ``ring-2.6-1t-free``, ``big-pickle``) were indistinguishable from paid
++ones. ``hermes_cli.model_picker_specs`` builds the row suffix from the provider's own pricing
++feed when it publishes one, and from models.dev otherwise — which is the only source covering
++opencode-go/opencode-zen, whose ``/v1/models`` endpoints publish no prices at all.
++
++These tests also pin the property that makes the decoration safe: the row label must still
++START with the raw model id, and the picker must keep resolving/committing on raw ids.
++"""
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import hermes_cli.model_picker_specs as specs
++
++
++def _info(**over):
++    """models.dev ModelInfo stand-in with the fields the suffix builder reads."""
++    base = dict(
++        cost_input=0.0, cost_output=0.0, context_window=200_000, max_output=64_000,
++        reasoning=True, status="")
++    base.update(over)
++    info = SimpleNamespace(**base)
++    info.supports_vision = lambda: over.get("vision", False)
++    info.supports_pdf = lambda: over.get("pdf", False)
++    info.supports_audio_input = lambda: over.get("audio", False)
++    return info
++
++
++def _row(**over):
++    row = {"slug": "opencode-zen", "models": [], "capabilities": {}, "pricing": {}}
++    row.update(over)
++    return row
++
++
++def setup_function(_func=None):
++    specs.clear_spec_cache()
++
++
++def test_paid_model_shows_price_context_and_capabilities():
++    """A paid model with catalog metadata renders price, context, output and capability flags."""
++    with patch.object(specs, "_lookup_models_dev",
++                      lambda slug, mid, cfg: _info(cost_input=3.0, cost_output=15.0,
++                                                   context_window=1_000_000, max_output=64_000,
++                                                   vision=True)):
++        label = specs.decorate_model_label("claude-sonnet-4-5", _row(slug="opencode-zen"))
++
++    assert label.startswith("claude-sonnet-4-5 ")
++    assert "$3/$15" in label
++    assert "1M ctx" in label
++    assert "64K out" in label
++    assert "reasoning" in label and "vision" in label
++    assert "FREE" not in label
++
++
++def test_free_model_is_labeled_free():
++    """A zero-cost catalog entry is the free tier — this is the label that was missing."""
++    with patch.object(specs, "_lookup_models_dev",
++                      lambda slug, mid, cfg: _info(cost_input=0.0, cost_output=0.0,
++                                                   context_window=1_048_576, max_output=128_000)):
++        label = specs.decorate_model_label("beam-free", _row(slug="opencode-go"))
++
++    assert "FREE" in label, "a zero-cost model must be labeled FREE"
++    assert "$" not in label, "no price pair on a free row"
++    assert "1M ctx" in label
++
++
++def test_free_suffix_labels_even_without_metadata():
++    """The provider's own naming (``-free`` / ``:free``) is enough to label a row FREE."""
++    with patch.object(specs, "_lookup_models_dev", lambda slug, mid, cfg: None):
++        go_label = specs.decorate_model_label("ring-2.6-1t-free", _row(slug="opencode-zen"))
++        or_label = specs.decorate_model_label("z-ai/glm-5.2:free", _row(slug="openrouter"))
++        paid_label = specs.decorate_model_label("z-ai/glm-5.2", _row(slug="openrouter"))
++
++    assert "FREE" in go_label and "FREE" in or_label
++    assert paid_label == "z-ai/glm-5.2", "no metadata and no free naming: no fabricated suffix"
++
++
++def test_provider_pricing_feed_wins_over_models_dev():
++    """Live provider pricing is what the account is billed — it beats catalog cost data."""
++    row = _row(slug="openrouter", pricing={"z-ai/glm-5.2": {"input": "$0.03", "output": "$7.00",
++                                                            "cache": None, "free": False}})
++    with patch.object(specs, "_lookup_models_dev",
++                      lambda slug, mid, cfg: _info(cost_input=9.0, cost_output=9.0)):
++        label = specs.decorate_model_label("z-ai/glm-5.2", row)
++
++    assert "$0.03/$7.00" in label and "9" not in label.split("ctx")[0]
++
++
++def test_provider_pricing_free_flag_labels_free():
++    row = _row(slug="nous", pricing={"mystery-model": {"input": "free", "output": "free",
++                                                       "cache": None, "free": True}})
++    with patch.object(specs, "_lookup_models_dev", lambda slug, mid, cfg: None):
++        label = specs.decorate_model_label("mystery-model", row)
++
++    assert "FREE" in label
++
++
++def test_deprecated_status_is_surfaced():
++    with patch.object(specs, "_lookup_models_dev",
++                      lambda slug, mid, cfg: _info(status="deprecated")):
++        label = specs.decorate_model_label("ring-2.6-1t-free", _row(slug="opencode-zen"))
++
++    assert "deprecated" in label
++
++
++def test_unknown_metadata_renders_bare_id_and_spec_errors_never_raise():
++    """No metadata → bare id; a metadata explosion must cost a suffix, never the row."""
++    with patch.object(specs, "_lookup_models_dev", lambda slug, mid, cfg: None):
++        assert specs.decorate_model_label("some-model", _row()) == "some-model"
++
++    def _boom(*_a, **_k):
++        raise RuntimeError("catalog exploded")
++
++    with patch.object(specs, "_lookup_models_dev", _boom):
++        assert specs.decorate_model_label("some-model", _row()) == "some-model"
++
++
++def test_capability_map_from_inventory_is_honoured():
++    """The inventory's own capability map (the same one that gates the effort step) wins."""
++    row = _row(capabilities={"glm-5.2": {"fast": False, "reasoning": False}})
++    with patch.object(specs, "_lookup_models_dev",
++                      lambda slug, mid, cfg: _info(reasoning=True, cost_input=0.2, cost_output=1.2)):
++        label = specs.decorate_model_label("glm-5.2", row)
++
++    assert "reasoning" not in label, "inventory says no reasoning control; do not claim it"
++
++
++def test_legend_gate():
++    assert specs.rows_have_pricing(["beam-free · FREE · 1M ctx", "x · 1M ctx"]) is True
++    assert specs.rows_have_pricing(["a · $3/$15", "b"]) is True
++    assert specs.rows_have_pricing(["a", "b"]) is False
++
++
++def test_suffixes_are_memoized_per_provider_and_model():
++    calls = []
++
++    def _count(slug, mid, cfg):
++        calls.append((slug, mid))
++        return _info(cost_input=1.0, cost_output=2.0)
++
++    with patch.object(specs, "_lookup_models_dev", _count):
++        row = _row(slug="opencode-zen")
++        specs.decorate_model_label("m", row)
++        specs.decorate_model_label("m", row)
++        specs.decorate_model_label("m", _row(slug="other"))
++
++    assert len(calls) == 2, "same provider+model must not re-resolve metadata per keystroke"
++
++
++def test_show_model_picker_requests_pricing_for_the_rows():
++    """``_show_model_picker`` must ask inventory for pricing or no row can be priced/labeled."""
++    from hermes_cli.cli_model_switch_mixin import _show_model_picker
++
++    captured: dict = {}
++
++    def _fake_build(_ctx, **kwargs):
++        captured.update(kwargs)
++        return {"providers": [{"slug": "opencode-go", "models": ["beam-free"]}]}
++
++    cli = SimpleNamespace(model="deepseek-flash", provider="opencode-go",
++                          _open_model_picker=MagicMock())
++    ctx = SimpleNamespace(user_providers={}, custom_providers=[])
++    with patch("hermes_cli.inventory.build_models_payload", side_effect=_fake_build):
++        _show_model_picker(cli, ctx, force_refresh=False)
++
++    assert captured.get("pricing") is True
++    assert captured.get("pricing_cache_only") is True, (
++        "the picker must not block the REPL on a cold endpoint's pricing fetch")
++
++
++def test_picker_rows_still_resolve_on_raw_ids_after_decoration():
++    """Filtering stays raw-id based, so a decorated label can never change the committed model."""
++    from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
++
++    raw = ["beam-free", "claude-sonnet-4-5", "glm-5.2"]
++    with patch.object(specs, "_lookup_models_dev",
++                      lambda slug, mid, cfg: _info(cost_input=0.0, cost_output=0.0)):
++        labels = [specs.decorate_model_label(m, _row()) for m in raw]
++
++    filtered = CLIModelSwitchMixin._filter_model_picker_entries(raw, "claude")
++    assert [e for (_i, e) in filtered] == ["claude-sonnet-4-5"]
++    assert labels[1].startswith("claude-sonnet-4-5"), "label keeps the raw id as its first token"

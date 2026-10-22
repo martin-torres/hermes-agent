@@ -1,0 +1,29 @@
+feat(cli): show price, context and capabilities on /model picker rows
+
+The picker listed bare model ids, so nothing on screen said what a model
+costs and free models were indistinguishable from paid ones. opencode-go
+and opencode-zen publish no prices on their /v1/models endpoints, so every
+row for either provider rendered with no price at all and the free SKUs
+(beam-free, ring-2.6-1t-free, big-pickle) carried no label.
+
+Rows now carry a compact spec suffix, built from the provider's own pricing
+feed when it publishes one and from models.dev otherwise:
+
+    claude-sonnet-4-5 · $3/$15 · 1M ctx · 64K out · reasoning, vision
+    beam-free · FREE · 1M ctx · 131K out · reasoning
+
+- hermes_cli/model_picker_specs.py builds the suffix and memoizes it per
+  (provider, model) — the picker re-renders on every filter keystroke. The
+  raw id stays the row's first token, and a metadata failure drops the
+  suffix rather than the row.
+- _show_model_picker requests pricing=True with pricing_cache_only=True, so
+  a cold endpoint's prices arrive on a later open instead of stalling the
+  REPL.
+- The model stage decorates labels only: _filtered_pairs keeps the raw ids,
+  so filtering and the commit resolve exactly as before.
+- The stage hint gains a one-line legend ("price = $ per 1M tokens
+  (in/out), FREE = no charge") only when a row actually carries one.
+
+Verified: 12 new tests in tests/hermes_cli/test_model_picker_specs.py plus the existing
+picker suites (32 passed), and a render against the real catalogs prices 44 of 45
+opencode-go rows and labels 13 free models on opencode-zen.
