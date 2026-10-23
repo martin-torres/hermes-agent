@@ -1,0 +1,16 @@
+artifacts/model-picker-price-specs/KEEP-ACROSS-UPDATES.md
+  h_11d592aaeb00de 1-81
+artifacts/model-picker-price-specs/reapply-model-picker-specs.sh
+  h_11d592aaeb00de 1-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "554f50e96a564bd6a5cb6b45e2d9c9c16539d2dd",
+  "prompts": {},
+  "humans": {
+    "h_11d592aaeb00de": {
+      "author": "Drtorres <dr.mtorres@icloud.com>"
+    }
+  }
+}
