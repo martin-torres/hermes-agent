@@ -2187,6 +2187,7 @@ cli:
     picker_provider_fallback: "Provider"
     picker_filter_hint: "Filter: {query}▏  ({shown}/{total} match — type to narrow, Backspace to clear)"
     picker_select_hint: "Select a model ({count} available) — type to filter"
+    picker_pricing_legend: "price = $ per 1M tokens (in/out), FREE = no charge"
     picker_empty: "No models listed for this provider. Use Back or Cancel."
     palette_title: "⚙ Command Palette"
     palette_filter_hint: "Filter: {query}▏  ({shown}/{total} match — Enter inserts, Esc cancels)"

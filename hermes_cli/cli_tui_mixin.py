@@ -605,8 +605,17 @@ class CLITuiMixin:
             filtered_pairs = self._filter_model_picker_entries(model_list, _query)
             state["_filtered_pairs"] = filtered_pairs
             model_labels = [e for (_i, e) in filtered_pairs]
+            from hermes_cli.model_picker_specs import model_spec_suffix, rows_have_pricing
             from hermes_cli.model_picker_usage import annotate_window_plan_rows
+            # Plan tags resolve the RAW ids, so annotate first and append this row's
+            # price/context/capability suffix by position afterwards (both keep order + length).
+            # ``_filtered_pairs`` itself stays raw, so filtering and the commit are unaffected.
             row_labels, limit_line = annotate_window_plan_rows(provider_data, model_labels)
+            if len(row_labels) == len(filtered_pairs):
+                row_labels = [
+                    f"{label}{model_spec_suffix(_candidate, provider_data)}"
+                    for label, (_i, _candidate) in zip(row_labels, filtered_pairs)
+                ]
             choices = row_labels + [t("cli.shared.back"), t("cli.shared.cancel")]
             if _query:
                 hint = t("cli.tui.picker_filter_hint", query=_query, shown=len(model_labels), total=len(model_list))
@@ -614,6 +623,9 @@ class CLITuiMixin:
                 hint = t("cli.tui.picker_select_hint", count=len(model_list))
             else:
                 hint = t("cli.tui.picker_empty")
+            if rows_have_pricing(row_labels):
+                legend = t("cli.tui.picker_pricing_legend")
+                hint = f"{hint}{' · ' if hint else ''}{legend}"
             # Window plan past an allowance: say once what happens next (pay as you go or wait), above the hint.
             if limit_line:
                 hint = [limit_line, hint]
